@@ -1,0 +1,250 @@
+# ==============================================================================
+# PROYECTO ERC STANFORD: PIPELINE DEFINITIVO Y BLINDADO (AUDITORÍA 2009 VS 2021)
+# Cohorte: NHANES 2017 - Marzo 2020 Prepandemia (CDC)
+# ==============================================================================
+
+# 0. PAQUETES
+needed_pkgs <- c("haven", "dplyr", "purrr", "tidymodels", "xgboost", 
+                 "yardstick", "survey", "srvyr", "svrep", "matrixStats", "glmnet", "probably")
+new_pkgs <- needed_pkgs[!(needed_pkgs %in% installed.packages()[,"Package"])]
+if(length(new_pkgs)) install.packages(new_pkgs)
+
+library(haven)
+library(dplyr)
+library(purrr)
+library(tidymodels)
+library(xgboost)
+library(yardstick)
+library(survey)
+library(srvyr)
+library(svrep)
+library(matrixStats)
+library(glmnet)
+library(probably)
+
+message("=== 1. CARGA LOCAL DE MICRODATOS OFICIALES DE NHANES ===")
+
+data_dir <- "~/Desktop/CONGRESO_IA_STANFORD"
+
+read_local_xpt <- function(pattern_name) {
+  files_in_dir <- list.files(data_dir, full.names = TRUE)
+  matched_file <- files_in_dir[grep(paste0("^", pattern_name, "(\\b|\\.|\\()"), basename(files_in_dir), ignore.case = TRUE)][1]
+  if (is.na(matched_file) || !file.exists(matched_file)) {
+    stop(paste("ERROR: No se encuentra ningún archivo que empiece por", pattern_name, "en la carpeta:", data_dir))
+  }
+  return(read_xpt(matched_file))
+}
+
+demo_raw   <- read_local_xpt("P_DEMO")
+biopro_raw <- read_local_xpt("P_BIOPRO")
+albcr_raw  <- read_local_xpt("P_ALB_CR")
+tchol_raw  <- read_local_xpt("P_TCHOL")
+bmx_raw    <- read_local_xpt("P_BMX")
+bpx_raw    <- read_local_xpt("P_BPXO")
+kiq_raw    <- read_local_xpt("P_KIQ_P")
+ocq_raw    <- read_local_xpt("P_OCQ")
+smq_raw    <- read_local_xpt("P_SMQ")
+diq_raw    <- read_local_xpt("P_DIQ")
+bpq_raw    <- read_local_xpt("P_BPQ")
+
+demo_df <- demo_raw %>%
+  select(SEQN, RIDAGEYR, RIAGENDR, RIDRETH3, INDFMPIR, 
+         WTMECPR = matches("^WTMEC|^WTINT")[1], SDMVPSU, SDMVSTRA)
+
+biopro_df <- biopro_raw %>%
+  select(SEQN, 
+         LBXXSC = matches("LBXXSC|LBXSCR|SC")[1], 
+         LBXSGL = matches("LBXSGL|GLU")[1], 
+         LBXSUA = matches("LBXSUA|UA")[1], 
+         LBXSBU = matches("LBXSBU|BU")[1])
+
+albcr_df <- albcr_raw %>%
+  select(SEQN, 
+         URDACT = matches("URDACT|ALB")[1], 
+         URXUCR = matches("URXUCR|CR")[1])
+
+tchol_df <- tchol_raw %>% select(SEQN, LBXTC = matches("LBXTC|TC")[1])
+bmx_df   <- bmx_raw   %>% select(SEQN, BMXBMI, BMXWAIST)
+bpx_df   <- bpx_raw   %>% select(SEQN, BPXOSY1 = matches("BPXOSY1|BPXSY1")[1], BPXODI1 = matches("BPXODI1|BPXDI1")[1])
+kiq_df   <- kiq_raw   %>% select(SEQN, KIQ022 = matches("KIQ022|KIQ020")[1])
+ocq_df   <- ocq_raw   %>% select(SEQN, OCD150 = matches("OCD150|OCQ")[1])
+smq_df   <- smq_raw   %>% select(SEQN, SMQ020 = matches("SMQ020")[1])
+diq_df   <- diq_raw   %>% select(SEQN, DIQ010 = matches("DIQ010")[1])
+bpq_df   <- bpq_raw   %>% select(SEQN, BPQ020 = matches("BPQ020")[1])
+
+list_dfs <- list(demo_df, biopro_df, albcr_df, tchol_df, bmx_df, bpx_df, kiq_df, ocq_df, smq_df, diq_df, bpq_df)
+nhanes_raw <- reduce(list_dfs, left_join, by = "SEQN")
+
+# 1. FÓRMULAS eGFR Y CONSTRUCCIÓN DE TARGETS (2009 VS 2021)
+calc_egfr_2021 <- function(scr, age, sex) {
+  kappa <- ifelse(sex == 2, 0.7, 0.9)
+  alpha <- ifelse(sex == 2, -0.241, -0.302)
+  fem_factor <- ifelse(sex == 2, 1.012, 1.0)
+  scr_k <- scr / kappa
+  return(142 * (pmin(scr_k, 1)^alpha) * (pmax(scr_k, 1)^(-1.200)) * (0.9938^age) * fem_factor)
+}
+
+calc_egfr_2009 <- function(scr, age, sex, black) {
+  kappa <- ifelse(sex == 2, 0.7, 0.9)
+  alpha <- ifelse(sex == 2, -0.329, -0.411)
+  fem_factor <- ifelse(sex == 2, 1.018, 1.0)
+  black_factor <- ifelse(black == 1, 1.159, 1.0)
+  scr_k <- scr / kappa
+  return(141 * (pmin(scr_k, 1)^alpha) * (pmax(scr_k, 1)^(-1.209)) * (0.993^age) * fem_factor * black_factor)
+}
+
+data_clean <- nhanes_raw %>%
+  filter(RIDAGEYR >= 20) %>%
+  mutate(
+    es_mujer = ifelse(RIAGENDR == 2, 1, 0),
+    es_afro  = ifelse(RIDRETH3 == 4, 1, 0),
+    UACR     = (URDACT / URXUCR) * 100,
+    
+    eGFR_2021 = calc_egfr_2021(LBXXSC, RIDAGEYR, RIAGENDR),
+    eGFR_2009 = calc_egfr_2009(LBXXSC, RIDAGEYR, RIAGENDR, es_afro),
+    
+    diag_previo = ifelse(!is.na(KIQ022) & KIQ022 == 1, 1, 0),
+    
+    Target_2021 = factor(ifelse((eGFR_2021 < 60 | UACR >= 30) & diag_previo == 0, "Case", "Control"), levels = c("Control", "Case")),
+    Target_2009 = factor(ifelse((eGFR_2009 < 60 | UACR >= 30) & diag_previo == 0, "Case", "Control"), levels = c("Control", "Case")),
+    
+    PIR_Bajo = ifelse(!is.na(INDFMPIR) & INDFMPIR < 1.35, "Bajo_Ingreso", "Alto_Ingreso")
+  ) %>%
+  filter(!is.na(Target_2021) & !is.na(Target_2009) & !is.na(WTMECPR) & WTMECPR > 0 & !is.na(SDMVPSU) & !is.na(SDMVSTRA))
+
+# IMPUTACIÓN PONDERADA
+num_vars <- c("BMXBMI", "BMXWAIST", "BPXOSY1", "BPXODI1", "INDFMPIR", "LBXSGL", "LBXSUA", "LBXSBU", "LBXTC")
+for(v in num_vars) {
+  if(v %in% names(data_clean)) {
+    valid_idx <- !is.na(data_clean[[v]])
+    w_med <- weightedMedian(data_clean[[v]][valid_idx], w = data_clean$WTMECPR[valid_idx])
+    data_clean[[v]][is.na(data_clean[[v]])] <- w_med
+  }
+}
+
+# AUDITORÍA DE RECLASIFICACIÓN NETO (2009 VS 2021 EN POBLACIÓN AFROAMERICANA)
+message("=== AUDITORÍA DE RECLASIFICACIÓN EN AFROAMERICANOS (CKD-EPI 2009 VS 2021) ===")
+afro_pop <- data_clean %>% filter(es_afro == 1)
+reclass_table <- table(CKD_2009 = afro_pop$Target_2009, CKD_2021 = afro_pop$Target_2021)
+print(reclass_table)
+
+# 2. PARTICIÓN Y RECETAS
+set.seed(2026)
+data_split <- initial_split(data_clean, prop = 0.70, strata = Target_2021)
+train_data <- training(data_split) %>% mutate(case_wts = importance_weights(WTMECPR / mean(WTMECPR)))
+test_data  <- testing(data_split)  %>% mutate(case_wts = importance_weights(WTMECPR / mean(WTMECPR)))
+
+rec_stage1 <- recipe(
+  Target_2021 ~ RIDAGEYR + RIAGENDR + BMXBMI + BMXWAIST + 
+    BPXOSY1 + BPXODI1 + DIQ010 + BPQ020 + SMQ020 + INDFMPIR + OCD150 + case_wts,
+  data = train_data
+) %>%
+  step_impute_mode(all_nominal_predictors(), -has_role("case_weights")) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_zv(all_predictors(), -has_role("case_weights")) %>%
+  step_normalize(all_numeric_predictors(), -has_role("case_weights"))
+
+rec_stage2 <- recipe(
+  Target_2021 ~ RIDAGEYR + RIAGENDR + BMXBMI + BMXWAIST + 
+    BPXOSY1 + BPXODI1 + DIQ010 + BPQ020 + SMQ020 + INDFMPIR + OCD150 +
+    LBXSGL + LBXSUA + LBXSBU + LBXTC + case_wts,
+  data = train_data
+) %>%
+  step_impute_mode(all_nominal_predictors(), -has_role("case_weights")) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_zv(all_predictors(), -has_role("case_weights")) %>%
+  step_normalize(all_numeric_predictors(), -has_role("case_weights"))
+
+# REGRESIÓN LOGÍSTICA REGULARIZADA Y XGBOOST
+lr_spec  <- logistic_reg(penalty = 0.01, mixture = 0.5) %>% set_engine("glmnet") %>% set_mode("classification")
+xgb_spec <- boost_tree(trees = 500, tree_depth = 4, learn_rate = 0.05) %>% set_engine("xgboost") %>% set_mode("classification")
+
+wf_lr   <- workflow() %>% add_recipe(rec_stage1) %>% add_model(lr_spec) %>% add_case_weights(case_wts)
+wf_xgb1 <- workflow() %>% add_recipe(rec_stage1) %>% add_model(xgb_spec) %>% add_case_weights(case_wts)
+wf_xgb2 <- workflow() %>% add_recipe(rec_stage2) %>% add_model(xgb_spec) %>% add_case_weights(case_wts)
+
+fit_lr   <- fit(wf_lr, data = train_data)
+fit_xgb1 <- fit(wf_xgb1, data = train_data)
+fit_xgb2 <- fit(wf_xgb2, data = train_data)
+
+train_preds <- train_data %>% bind_cols(predict(fit_xgb1, train_data, type = "prob"))
+
+# OPTIMIZACIÓN DE UMBRAL CON PROBABLY: Sensibilidad >= 85% (FNR <= 15%) y Máxima Especificidad
+threshold_results <- threshold_perf(
+  train_preds,
+  truth = Target_2021,
+  estimate = .pred_Case,
+  thresholds = seq(0.5, 0.99, by = 0.005),
+  metrics = metric_set(sens, spec, ppv),
+  event_level = "second"
+)
+
+optimal_fair_threshold <- threshold_results %>%
+  filter(.metric == "sens" & .estimate >= 0.85) %>%
+  inner_join(threshold_results %>% filter(.metric == "spec"), by = ".threshold", suffix = c("_sens", "_spec")) %>%
+  arrange(desc(.estimate_spec)) %>%
+  slice(1) %>%
+  pull(.threshold)
+
+message(paste("★ Nuevo Umbral Calibrado de Equidad (FNR <= 15%):", round(optimal_fair_threshold, 4)))
+
+# EVALUACIÓN EN TEST SET CON EL UMBRAL OPTIMIZADO
+test_preds <- test_data %>%
+  bind_cols(predict(fit_lr, test_data, type = "prob") %>% rename(.pred_Case_LR = .pred_Case)) %>%
+  bind_cols(predict(fit_xgb1, test_data, type = "prob") %>% rename(.pred_Case_XGB1 = .pred_Case)) %>%
+  bind_cols(predict(fit_xgb2, test_data, type = "prob") %>% rename(.pred_Case_XGB2 = .pred_Case)) %>%
+  mutate(
+    pred_class = factor(ifelse(.pred_Case_XGB1 >= optimal_fair_threshold, "Case", "Control"), levels = c("Control", "Case"))
+  )
+
+auc_lr   <- roc_auc(test_preds, truth = Target_2021, .pred_Case_LR, event_level = "second")$.estimate
+auc_xgb1 <- roc_auc(test_preds, truth = Target_2021, .pred_Case_XGB1, event_level = "second")$.estimate
+auc_xgb2 <- roc_auc(test_preds, truth = Target_2021, .pred_Case_XGB2, event_level = "second")$.estimate
+
+message(paste("★ AUC Regresión Logística Regularizada (Baseline Real):", round(auc_lr, 3)))
+message(paste("★ AUC XGBoost Stage 1 (Zero-Lab Principal)         :", round(auc_xgb1, 3)))
+message(paste("★ AUC XGBoost Stage 2 (Lab-Enhanced)               :", round(auc_xgb2, 3)))
+
+# SURVEY BOOTSTRAP COMPARATIVO (FNR 2009 VS FNR 2021 Y ESPECIFICIDAD)
+test_survey_design <- test_preds %>% as_survey_design(ids = SDMVPSU, strata = SDMVSTRA, weights = WTMECPR, nest = TRUE)
+survey_boot_design <- as_bootstrap_design(test_survey_design, replicates = 1000)
+
+calc_metrics_rep <- function(df_sub) {
+  sub_afro <- df_sub %>% filter(RIDRETH3 == 4 & PIR_Bajo == "Bajo_Ingreso")
+  
+  # FNR bajo 2021
+  casos_2021 <- sum(sub_afro$Target_2021 == "Case")
+  fnr_2021 <- ifelse(casos_2021 == 0, NA, sum(sub_afro$Target_2021 == "Case" & sub_afro$pred_class == "Control") / casos_2021)
+  
+  # FNR bajo 2009
+  casos_2009 <- sum(sub_afro$Target_2009 == "Case")
+  fnr_2009 <- ifelse(casos_2009 == 0, NA, sum(sub_afro$Target_2009 == "Case" & sub_afro$pred_class == "Control") / casos_2009)
+  
+  # Especificidad en el subgrupo
+  controles_2021 <- sum(sub_afro$Target_2021 == "Control")
+  spec_2021 <- ifelse(controles_2021 == 0, NA, sum(sub_afro$Target_2021 == "Control" & sub_afro$pred_class == "Control") / controles_2021)
+  
+  return(c(fnr_2021 = fnr_2021, fnr_2009 = fnr_2009, spec = spec_2021))
+}
+
+rep_weights <- weights(survey_boot_design, type = "analysis")
+boot_res <- matrix(NA, nrow = 1000, ncol = 3)
+
+for(i in 1:1000) {
+  w_i <- rep_weights[, i]
+  df_rep <- test_preds[w_i > 0, ]
+  boot_res[i, ] <- calc_metrics_rep(df_rep)
+}
+
+fnr_2021_ci <- quantile(boot_res[,1], probs = c(0.025, 0.50, 0.975), na.rm = TRUE)
+fnr_2009_ci <- quantile(boot_res[,2], probs = c(0.025, 0.50, 0.975), na.rm = TRUE)
+spec_ci     <- quantile(boot_res[,3], probs = c(0.025, 0.50, 0.975), na.rm = TRUE)
+
+message("★ FNR 2021 en Afroamericanos de Bajo Ingreso (Mediana [IC 95%]):")
+print(round(fnr_2021_ci, 4))
+
+message("★ FNR 2009 en Afroamericanos de Bajo Ingreso (Mediana [IC 95%]):")
+print(round(fnr_2009_ci, 4))
+
+message("★ Especificidad en Afroamericanos de Bajo Ingreso (Mediana [IC 95%]):")
+print(round(spec_ci, 4))
