@@ -1,0 +1,22 @@
+{
+    "1": {
+        "nombre": "ana",
+        "roles": [
+            "user",
+            "admin"
+        ]
+    },
+    "2": {
+        "nombre": "luis",
+        "roles": [
+            "user"
+        ]
+    },
+    "3": {
+        "nombre": "marta",
+        "roles": [
+            "moderator",
+            "user"
+        ]
+    }
+}

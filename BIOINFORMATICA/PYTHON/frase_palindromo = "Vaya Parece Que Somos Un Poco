@@ -1,0 +1,18 @@
+frase_palindromo = "Vaya Parece Que Somos Un Poco Kamikazes Pero Ya Casi Esta"
+palabras = frase_palindromo.split() #split separa la frase por espacios
+
+def es_palindromo(palabra):
+    palabra = palabra.lower() #lower hace todo en minusculas
+    return palabra == palabra[::-1] #[::-1] pone la palabra al reves
+
+primera_letra = None
+
+for palabra in palabras:
+    if es_palindromo(palabra):
+        primera_letra = palabra[0]
+        break
+
+if primera_letra:
+    print("La primera letra del primer palíndromo es:", primera_letra)
+else:
+    print("No hay ninguna palabra palíndroma en la frase.")

@@ -1,0 +1,4 @@
+id,nombre,roles
+1,ANA,user|admin
+2,LUIS,user
+3,MARTA,moderator|user

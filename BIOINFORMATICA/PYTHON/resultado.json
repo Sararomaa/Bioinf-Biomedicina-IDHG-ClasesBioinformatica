@@ -1,0 +1,17 @@
+[
+    {
+        "nombre": "Ana",
+        "promedio": 20.0,
+        "aprobado": true
+    },
+    {
+        "nombre": "Luis",
+        "promedio": 10.0,
+        "aprobado": false
+    },
+    {
+        "nombre": "Marta",
+        "promedio": 58.333333333333336,
+        "aprobado": true
+    }
+]
